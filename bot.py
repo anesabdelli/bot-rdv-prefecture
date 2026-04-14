@@ -202,6 +202,21 @@ async def send_notification(app: Application, text: str) -> None:
         logger.error(f"Failed to send Telegram message: {exc}")
 
 
+async def send_alarm(app: Application, text: str) -> None:
+    """Spam 5 loud notifications so the user can't miss it."""
+    for i in range(5):
+        try:
+            await app.bot.send_message(
+                chat_id=CHAT_ID,
+                text=("🚨🚨🚨 " if i > 0 else "") + text,
+                parse_mode=ParseMode.HTML,
+                disable_notification=False,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to send alarm message: {exc}")
+        await asyncio.sleep(2)
+
+
 # ── Monitoring loop ───────────────────────────────────────────────────────────
 
 async def monitor_loop(app: Application) -> None:
@@ -277,7 +292,7 @@ async def monitor_loop(app: Application) -> None:
         if status == "available":
             if prev_slots is not True:   # new transition → available
                 state["slots_available"] = True
-                await send_notification(
+                await send_alarm(
                     app,
                     f"🎉 <b>RDV SLOTS ARE AVAILABLE!</b>\n"
                     f"{detail}\n\n"
