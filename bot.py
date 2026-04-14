@@ -36,7 +36,7 @@ RDV_URL = (
     "&public_link_organisation_id=2458"
 )
 
-CHECK_INTERVAL  = 60   # seconds between checks
+CHECK_INTERVAL  = 5    # seconds between checks
 REQUEST_TIMEOUT = 15   # seconds for each HTTP request
 BACKOFF_AFTER_BLOCK = 300  # 5 min pause after getting blocked
 
