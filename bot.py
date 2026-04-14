@@ -204,7 +204,7 @@ async def send_notification(app: Application, text: str) -> None:
 
 async def send_alarm(app: Application, text: str) -> None:
     """Spam 5 loud notifications so the user can't miss it."""
-    for i in range(5):
+    for i in range(20):
         try:
             await app.bot.send_message(
                 chat_id=CHAT_ID,
@@ -214,7 +214,7 @@ async def send_alarm(app: Application, text: str) -> None:
             )
         except Exception as exc:
             logger.error(f"Failed to send alarm message: {exc}")
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.3)
 
 
 # ── Monitoring loop ───────────────────────────────────────────────────────────
