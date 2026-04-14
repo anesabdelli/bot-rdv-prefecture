@@ -23,7 +23,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-load_dotenv()
+load_dotenv(dotenv_path=".env", override=False)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
