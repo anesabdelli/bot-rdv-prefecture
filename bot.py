@@ -326,7 +326,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"/monitor – start monitoring\n"
         f"/stop    – stop monitoring\n"
         f"/check   – run a single check right now\n"
-        f"/status  – show current status"
+        f"/status  – show current status\n"
+        f"/test    – fire a test alarm"
     )
 
 
@@ -376,6 +377,17 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg += f'\n\n👉 <a href="{RDV_URL}">Book your appointment NOW</a>'
 
     await update.message.reply_html(msg)
+
+
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fire the alarm as if a slot just appeared — for testing."""
+    await update.message.reply_text("🔔 Firing test alarm…")
+    await send_alarm(
+        ctx.application,
+        f"🎉 <b>[TEST] RDV SLOTS ARE AVAILABLE!</b>\n"
+        f"This is a test notification.\n\n"
+        f"👉 <a href=\"{RDV_URL}\">Book your appointment NOW</a>"
+    )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -431,6 +443,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop",    cmd_stop))
     app.add_handler(CommandHandler("check",   cmd_check))
     app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("test",    cmd_test))
 
     logger.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
