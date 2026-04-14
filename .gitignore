@@ -1,0 +1,5 @@
+.env
+.claude/
+bot.log
+__pycache__/
+*.pyc
