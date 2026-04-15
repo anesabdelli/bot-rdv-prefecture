@@ -26,8 +26,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv(dotenv_path=".env", override=False)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")  # e.g. "rdv-prefecture-yourname"
 
 RDV_URL = (
     "https://rdv.anct.gouv.fr/prendre_rdv"
@@ -36,7 +37,7 @@ RDV_URL = (
     "&public_link_organisation_id=2458"
 )
 
-CHECK_INTERVAL  = 5    # seconds between checks
+CHECK_INTERVAL  = 3    # seconds between checks
 REQUEST_TIMEOUT = 15   # seconds for each HTTP request
 BACKOFF_AFTER_BLOCK = 300  # 5 min pause after getting blocked
 
@@ -217,6 +218,26 @@ async def send_alarm(app: Application, text: str) -> None:
         await asyncio.sleep(0.3)
 
 
+def send_ntfy_alarm() -> None:
+    """Send a max-priority push notification via ntfy.sh."""
+    if not NTFY_TOPIC:
+        return
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            headers={
+                "Title":    "RDV DISPONIBLE !!!",
+                "Priority": "urgent",
+                "Tags":     "rotating_light,calendar",
+            },
+            data="Un créneau est disponible ! Réservez maintenant.".encode("utf-8"),
+            timeout=10,
+        )
+        logger.info("ntfy alarm sent")
+    except Exception as exc:
+        logger.error(f"Failed to send ntfy notification: {exc}")
+
+
 # ── Monitoring loop ───────────────────────────────────────────────────────────
 
 async def monitor_loop(app: Application) -> None:
@@ -292,6 +313,7 @@ async def monitor_loop(app: Application) -> None:
         if status == "available":
             if prev_slots is not True:   # new transition → available
                 state["slots_available"] = True
+                send_ntfy_alarm()
                 await send_alarm(
                     app,
                     f"🎉 <b>RDV SLOTS ARE AVAILABLE!</b>\n"
@@ -382,6 +404,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Fire the alarm as if a slot just appeared — for testing."""
     await update.message.reply_text("🔔 Firing test alarm…")
+    send_ntfy_alarm()
     await send_alarm(
         ctx.application,
         f"🎉 <b>[TEST] RDV SLOTS ARE AVAILABLE!</b>\n"
