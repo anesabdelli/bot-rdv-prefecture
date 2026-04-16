@@ -28,7 +28,7 @@ load_dotenv(dotenv_path=".env", override=False)
 # ── Configuration ─────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")  # e.g. "rdv-prefecture-yourname"
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")  
 
 RDV_URL = (
     "https://rdv.anct.gouv.fr/prendre_rdv"
@@ -37,7 +37,7 @@ RDV_URL = (
     "&public_link_organisation_id=2458"
 )
 
-CHECK_INTERVAL  = 3    # seconds between checks
+CHECK_INTERVAL  = 1    # seconds between checks
 REQUEST_TIMEOUT = 15   # seconds for each HTTP request
 BACKOFF_AFTER_BLOCK = 300  # 5 min pause after getting blocked
 
