@@ -3,7 +3,6 @@
 Run this script ONCE on your PC to save your login session.
 A real browser window opens — log in via France Connect → impôts.gouv.fr.
 Once you can see the RDV page, press Enter here.
-The script saves your session and prints the SESSION_STATE value for Railway.
 """
 
 import asyncio
@@ -26,17 +25,22 @@ async def main() -> None:
         print("Once you can see your RDV page, come back here.\n")
 
         await page.goto(RESCHEDULE_URL)
-
         input("Press Enter once you are fully logged in... ")
 
-        await ctx.storage_state(path=SESSION_FILE)
+        # Save full storage state to file (used locally)
+        full_state = await ctx.storage_state()
 
-        with open(SESSION_FILE, "r", encoding="utf-8") as f:
-            raw = f.read()
+        # Extract only cookies (much smaller — safe for Railway env vars)
+        cookies_only = {"cookies": full_state["cookies"]}
 
-        b64 = base64.b64encode(raw.encode()).decode()
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(cookies_only, f)
+
+        b64 = base64.b64encode(json.dumps(cookies_only).encode()).decode()
 
         print(f"\n✅ Session saved to {SESSION_FILE}")
+        print(f"   Cookies saved: {len(cookies_only['cookies'])}")
+        print(f"   Base64 size:   {len(b64)} characters")
         print("\n--- Copy everything after the = and paste it as SESSION_STATE on Railway ---")
         print(f"SESSION_STATE={b64}")
         print("------------------------------------------------------------------------------\n")
