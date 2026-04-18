@@ -413,12 +413,19 @@ def send_ntfy_alarm() -> None:
 
 # ── Session keep-alive (uses persistent browser) ──────────────────────────────
 
+_keepalive_fail_streak = 0  # consecutive failures before notifying
+
+
 async def session_keepalive(job_ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Every 5 minutes: open a page in the persistent browser and visit the
     authenticated RDV page. This resets the sliding session on the server so
     it never expires as long as the bot is running.
+    Only notifies after 2 consecutive failures to avoid false positives from
+    transient redirects during page load.
     """
+    global _keepalive_fail_streak
+
     ctx = _browser_state.get("context")
     if ctx is None:
         logger.info("Session keep-alive: no browser context yet, skipping")
@@ -430,16 +437,23 @@ async def session_keepalive(job_ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await page.goto(RESCHEDULE_URL, timeout=20_000)
         await page.wait_for_load_state("networkidle", timeout=15_000)
 
-        if any(x in page.url for x in ("sign_in", "franceconnect", "impots.gouv")):
-            logger.warning("Session keep-alive: session expired")
-            await send_notification(
-                job_ctx.application,
-                "🔒 <b>Session expired!</b> Auto-booking is paused.\n\n"
-                "1. Run <code>python login.py</code> on your PC\n"
-                "2. Update <code>SESSION_STATE</code> on Railway\n"
-                "3. Railway will redeploy and reload the session automatically"
-            )
+        # Wait an extra moment to let any JS redirects settle
+        await asyncio.sleep(1)
+        final_url = page.url
+
+        if any(x in final_url for x in ("sign_in", "franceconnect", "impots.gouv")):
+            _keepalive_fail_streak += 1
+            logger.warning(f"Session keep-alive: session expired (streak={_keepalive_fail_streak})")
+            if _keepalive_fail_streak >= 2:
+                await send_notification(
+                    job_ctx.application,
+                    "🔒 <b>Session expired!</b> Auto-booking is paused.\n\n"
+                    "Restart <code>login.py</code>, log in again, then restart <code>bot.py</code>."
+                )
         else:
+            if _keepalive_fail_streak > 0:
+                logger.info(f"Session keep-alive: recovered after {_keepalive_fail_streak} failures")
+            _keepalive_fail_streak = 0
             logger.info("Session keep-alive: OK — session refreshed")
     except Exception as exc:
         logger.warning(f"Session keep-alive error: {exc}")
