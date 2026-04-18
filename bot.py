@@ -37,7 +37,7 @@ RDV_URL = (
     "&public_link_organisation_id=2458"
 )
 
-CHECK_INTERVAL  = 1    # seconds between checks
+CHECK_INTERVAL  = 0.1  # seconds between checks
 REQUEST_TIMEOUT = 15   # seconds for each HTTP request
 BACKOFF_AFTER_BLOCK = 300  # 5 min pause after getting blocked
 
@@ -205,7 +205,7 @@ async def send_notification(app: Application, text: str) -> None:
 
 async def send_alarm(app: Application, text: str) -> None:
     """Spam 5 loud notifications so the user can't miss it."""
-    for i in range(20):
+    for i in range(5):
         try:
             await app.bot.send_message(
                 chat_id=CHAT_ID,
