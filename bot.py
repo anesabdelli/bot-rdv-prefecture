@@ -413,56 +413,46 @@ def send_ntfy_alarm() -> None:
 
 # ── Session keep-alive (uses persistent browser) ──────────────────────────────
 
-_keepalive_fail_streak = 0  # consecutive failures before notifying
-
-
 async def session_keepalive(job_ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Every 5 minutes: open a page in the persistent browser and visit the
-    authenticated RDV page. This resets the sliding session on the server so
-    it never expires as long as the bot is running.
-    Only notifies after 2 consecutive failures to avoid false positives from
-    transient redirects during page load.
+    Every 5 minutes: hit the authenticated RDV page via HTTP to reset the
+    sliding session timer. HTTP is reliable and has no redirect false-positives.
     """
-    global _keepalive_fail_streak
+    def _ping() -> str:
+        cookies = _load_session_cookies()
+        if not cookies:
+            return "no_session"
+        try:
+            s = requests.Session()
+            s.max_redirects = 10
+            resp = s.get(
+                RESCHEDULE_URL,
+                headers={"User-Agent": BROWSER_UA, "Accept-Language": "fr-FR"},
+                cookies=cookies,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
+                return "expired"
+            return "ok"
+        except requests.exceptions.TooManyRedirects:
+            return "expired"
+        except Exception as exc:
+            return f"error:{exc}"
 
-    ctx = _browser_state.get("context")
-    if ctx is None:
-        logger.info("Session keep-alive: no browser context yet, skipping")
-        return
-
-    page = None
-    try:
-        page = await ctx.new_page()
-        await page.goto(RESCHEDULE_URL, timeout=20_000)
-        await page.wait_for_load_state("networkidle", timeout=15_000)
-
-        # Wait an extra moment to let any JS redirects settle
-        await asyncio.sleep(1)
-        final_url = page.url
-
-        if any(x in final_url for x in ("sign_in", "franceconnect", "impots.gouv")):
-            _keepalive_fail_streak += 1
-            logger.warning(f"Session keep-alive: session expired (streak={_keepalive_fail_streak})")
-            if _keepalive_fail_streak >= 2:
-                await send_notification(
-                    job_ctx.application,
-                    "🔒 <b>Session expired!</b> Auto-booking is paused.\n\n"
-                    "Restart <code>login.py</code>, log in again, then restart <code>bot.py</code>."
-                )
-        else:
-            if _keepalive_fail_streak > 0:
-                logger.info(f"Session keep-alive: recovered after {_keepalive_fail_streak} failures")
-            _keepalive_fail_streak = 0
-            logger.info("Session keep-alive: OK — session refreshed")
-    except Exception as exc:
-        logger.warning(f"Session keep-alive error: {exc}")
-    finally:
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
+    result = await asyncio.get_event_loop().run_in_executor(None, _ping)
+    if result == "ok":
+        logger.info("Session keep-alive: OK")
+    elif result == "no_session":
+        logger.info("Session keep-alive: skipped (no cookies)")
+    elif result == "expired":
+        logger.warning("Session keep-alive: session expired")
+        await send_notification(
+            job_ctx.application,
+            "🔒 <b>Session expired!</b>\n\n"
+            "Restart <code>login.py</code>, log in again, then restart <code>bot.py</code>."
+        )
+    else:
+        logger.warning(f"Session keep-alive: {result}")
 
 
 # ── Auto-booking (uses persistent browser) ────────────────────────────────────
