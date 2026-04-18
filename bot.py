@@ -196,9 +196,10 @@ def check_slots() -> dict:
     }
 
     try:
-        resp = requests.get(
-            RESCHEDULE_URL, headers=headers, cookies=cookies,
-            timeout=REQUEST_TIMEOUT, max_redirects=10,
+        session = requests.Session()
+        session.max_redirects = 10
+        resp = session.get(
+            RESCHEDULE_URL, headers=headers, cookies=cookies, timeout=REQUEST_TIMEOUT,
         )
     except requests.exceptions.TooManyRedirects:
         return {"status": "session_expired",
@@ -594,7 +595,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔄 Checking…")
-    result = check_slots()
+    result = await asyncio.get_event_loop().run_in_executor(None, check_slots)
     status = result["status"]
     emoji  = {
         "available":      "✅",
@@ -639,13 +640,17 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text("🔄 Checking session…")
     try:
-        resp = requests.get(
-            RESCHEDULE_URL,
-            headers={"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "fr-FR"},
-            cookies=cookies,
-            timeout=15,
-            allow_redirects=True,
-        )
+        def _do_session_check():
+            s = requests.Session()
+            s.max_redirects = 10
+            return s.get(
+                RESCHEDULE_URL,
+                headers={"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "fr-FR"},
+                cookies=cookies,
+                timeout=15,
+                allow_redirects=True,
+            )
+        resp = await asyncio.get_event_loop().run_in_executor(None, _do_session_check)
         if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
             await update.message.reply_html(
                 "🔒 <b>Session expired.</b>\n"
