@@ -37,6 +37,7 @@ CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID", "")
 NTFY_TOPIC       = os.getenv("NTFY_TOPIC", "")
 CURRENT_RDV_DATE = os.getenv("CURRENT_RDV_DATE", "")  # YYYY-MM-DD — your current appointment
 
+CHECK_URL      = "https://rdv.anct.gouv.fr/prendre_rdv?departement=&motif_name_with_location_type=renouvellement_de_recepisses_arrives_a_echeance_-public_office&public_link_organisation_id=2458"
 RESCHEDULE_URL = "https://rdv.anct.gouv.fr/users/rdvs/779995/creneaux"
 VIEW_URL       = "https://rdv.anct.gouv.fr/users/rdvs/779995"
 SESSION_FILE   = "session.json"
@@ -82,7 +83,6 @@ state: dict = {
     "error_streak":      0,
     "current_rdv_date":  None,   # updated in memory after each successful booking
     "booking_active":    False,  # prevents concurrent booking attempts
-    "session_notified":  False,  # prevents spamming session-expired messages
 }
 
 FRENCH_MONTHS = {
@@ -177,41 +177,12 @@ def _is_bookable(d: date) -> bool:
 
 # ── Website checker ───────────────────────────────────────────────────────────
 
-def _check_slots_no_session() -> bool:
-    """
-    Fallback check without session cookies.
-    Returns True if slots appear available, False otherwise.
-    Used when session is expired so alerts still fire.
-    """
-    try:
-        s = requests.Session()
-        s.max_redirects = 5
-        resp = s.get(
-            RESCHEDULE_URL,
-            headers={
-                "User-Agent":      random.choice(USER_AGENTS),
-                "Accept-Language": "fr-FR",
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return False
-        if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
-            return False
-        page_text = BeautifulSoup(resp.text, "html.parser").get_text(separator=" ", strip=True).lower()
-        return "tous les créneaux sont pris" not in page_text
-    except Exception:
-        return False
-
-
 def check_slots() -> dict:
     """
-    Fetch the reschedule page with session cookies.
+    Fetch the public availability page (no login required).
     Returns: { "status": str, "detail": str, "http_code": int|None }
-    Statuses: available | unavailable | session_expired | blocked |
-              rate_limited | captcha | error
+    Statuses: available | unavailable | blocked | rate_limited | captcha | error
     """
-    cookies = _load_session_cookies()
     headers = {
         "User-Agent":                random.choice(USER_AGENTS),
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -226,11 +197,11 @@ def check_slots() -> dict:
         session = requests.Session()
         session.max_redirects = 10
         resp = session.get(
-            RESCHEDULE_URL, headers=headers, cookies=cookies, timeout=REQUEST_TIMEOUT,
+            CHECK_URL, headers=headers, timeout=REQUEST_TIMEOUT,
         )
     except requests.exceptions.TooManyRedirects:
-        return {"status": "session_expired",
-                "detail": "Too many redirects — session expired (redirect loop)",
+        return {"status": "error",
+                "detail": "Too many redirects on public page",
                 "http_code": None}
     except requests.exceptions.Timeout:
         return {"status": "error", "detail": "Request timed out", "http_code": None}
@@ -359,7 +330,12 @@ async def try_book_earlier_slot(app: Application) -> bool:
             # Session expired inside Playwright
             if any(x in page.url for x in ("sign_in", "franceconnect", "impots.gouv")):
                 logger.warning("Auto-booking: session expired (Playwright)")
-                state["session_notified"] = False  # force fresh notification
+                await send_notification(
+                    app,
+                    "🔒 <b>Session expired!</b> Auto-booking is paused.\n\n"
+                    "1. Run <code>python login.py</code> on your PC\n"
+                    "2. Update <code>SESSION_STATE</code> on Railway"
+                )
                 return False
 
             page_text = (await page.inner_text("body")).lower()
@@ -504,38 +480,6 @@ async def monitor_loop(app: Application) -> None:
         state["last_check"]   = datetime.now()
         logger.info(f"Check #{state['check_count']}: [{status}] {detail}")
 
-        # ── Session expired ───────────────────────────────────────────────────
-        if status == "session_expired":
-            if not state["session_notified"]:
-                state["session_notified"] = True
-                await send_notification(
-                    app,
-                    "🔒 <b>Session expired!</b>\n\n"
-                    "1. Run <code>python login.py</code> on your PC\n"
-                    "2. Copy the <code>SESSION_STATE=...</code> value\n"
-                    "3. Update it in Railway Variables\n\n"
-                    "⚠️ Auto-booking is paused but alerts will still fire if slots appear."
-                )
-            # Try a cookie-less check as fallback — site may still show slot info
-            fallback = await asyncio.get_event_loop().run_in_executor(None, _check_slots_no_session)
-            if fallback and state["slots_available"] is not True:
-                state["slots_available"] = True
-                send_ntfy_alarm()
-                await send_alarm(
-                    app,
-                    f"🎉 <b>RDV SLOTS ARE AVAILABLE!</b>\n"
-                    f"⚠️ Session expired — <b>auto-booking paused</b>. Book manually!\n\n"
-                    f"👉 <a href=\"{RESCHEDULE_URL}\">Reschedule NOW</a>"
-                )
-            elif not fallback:
-                state["slots_available"] = None
-            await asyncio.sleep(CHECK_INTERVAL)
-            continue
-
-        # Session back — reset notification flag
-        if state["session_notified"] and status != "session_expired":
-            state["session_notified"] = False
-            await send_notification(app, "✅ <b>Session restored.</b> Auto-booking is active again.")
 
         # ── Blocked / rate-limited / CAPTCHA ──────────────────────────────────
         if status in ("blocked", "rate_limited", "captcha"):
@@ -619,7 +563,6 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state["extra_wait"]       = 0
     state["error_streak"]     = 0
     state["slots_available"]  = None
-    state["session_notified"] = False
     ctx.application.create_task(monitor_loop(ctx.application))
 
 
@@ -725,7 +668,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Monitoring   : {'🟢 ON' if s['monitoring'] else '🔴 OFF'}\n"
         f"Slots now    : {slot_icon}\n"
         f"Blocked      : {'⛔ YES' if s['blocked'] else '✅ no'}\n"
-        f"Session      : {'🔒 EXPIRED' if s['session_notified'] else '✅ ok'}\n"
+        f"Session      : {'✅ ok' if _get_session_path() else '❌ not found'}\n"
         f"Booking lock : {'🔄 active' if s['booking_active'] else '✅ free'}\n"
         f"Checks done  : {s['check_count']}\n"
         f"Last check   : {last}\n"
