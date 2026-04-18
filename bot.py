@@ -679,6 +679,51 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ── Session keep-alive ────────────────────────────────────────────────────────
+
+KEEPALIVE_INTERVAL = 5 * 60  # ping every 5 minutes
+
+
+async def session_keepalive(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ping the authenticated RDV page every 20 min to reset the sliding session."""
+    def _ping() -> str:
+        cookies = _load_session_cookies()
+        if not cookies:
+            return "no_session"
+        try:
+            s = requests.Session()
+            s.max_redirects = 10
+            resp = s.get(
+                RESCHEDULE_URL,
+                headers={"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "fr-FR"},
+                cookies=cookies,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
+                return "expired"
+            return "ok"
+        except requests.exceptions.TooManyRedirects:
+            return "expired"
+        except Exception as exc:
+            return f"error:{exc}"
+
+    result = await asyncio.get_event_loop().run_in_executor(None, _ping)
+    if result == "ok":
+        logger.info("Session keep-alive: OK (session refreshed)")
+    elif result == "no_session":
+        logger.info("Session keep-alive: skipped (no session configured)")
+    elif result == "expired":
+        logger.warning("Session keep-alive: session expired")
+        await send_notification(
+            ctx.application,
+            "🔒 <b>Session expired!</b> Auto-booking is paused.\n\n"
+            "1. Run <code>python login.py</code> on your PC\n"
+            "2. Update <code>SESSION_STATE</code> on Railway"
+        )
+    else:
+        logger.warning(f"Session keep-alive: {result}")
+
+
 # ── Auto-start ────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
@@ -690,6 +735,7 @@ async def post_init(app: Application) -> None:
         await monitor_loop(ctx.application)
 
     app.job_queue.run_once(_start, when=0)
+    app.job_queue.run_repeating(session_keepalive, interval=KEEPALIVE_INTERVAL, first=60)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
