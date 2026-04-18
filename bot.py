@@ -177,6 +177,33 @@ def _is_bookable(d: date) -> bool:
 
 # ── Website checker ───────────────────────────────────────────────────────────
 
+def _check_slots_no_session() -> bool:
+    """
+    Fallback check without session cookies.
+    Returns True if slots appear available, False otherwise.
+    Used when session is expired so alerts still fire.
+    """
+    try:
+        s = requests.Session()
+        s.max_redirects = 5
+        resp = s.get(
+            RESCHEDULE_URL,
+            headers={
+                "User-Agent":      random.choice(USER_AGENTS),
+                "Accept-Language": "fr-FR",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return False
+        if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
+            return False
+        page_text = BeautifulSoup(resp.text, "html.parser").get_text(separator=" ", strip=True).lower()
+        return "tous les créneaux sont pris" not in page_text
+    except Exception:
+        return False
+
+
 def check_slots() -> dict:
     """
     Fetch the reschedule page with session cookies.
@@ -487,9 +514,21 @@ async def monitor_loop(app: Application) -> None:
                     "1. Run <code>python login.py</code> on your PC\n"
                     "2. Copy the <code>SESSION_STATE=...</code> value\n"
                     "3. Update it in Railway Variables\n\n"
-                    "Monitoring continues but auto-booking is paused until you do this."
+                    "⚠️ Auto-booking is paused but alerts will still fire if slots appear."
                 )
-            state["slots_available"] = None
+            # Try a cookie-less check as fallback — site may still show slot info
+            fallback = await asyncio.get_event_loop().run_in_executor(None, _check_slots_no_session)
+            if fallback and state["slots_available"] is not True:
+                state["slots_available"] = True
+                send_ntfy_alarm()
+                await send_alarm(
+                    app,
+                    f"🎉 <b>RDV SLOTS ARE AVAILABLE!</b>\n"
+                    f"⚠️ Session expired — <b>auto-booking paused</b>. Book manually!\n\n"
+                    f"👉 <a href=\"{RESCHEDULE_URL}\">Reschedule NOW</a>"
+                )
+            elif not fallback:
+                state["slots_available"] = None
             await asyncio.sleep(CHECK_INTERVAL)
             continue
 
@@ -532,17 +571,16 @@ async def monitor_loop(app: Application) -> None:
         if status == "available":
             if prev_slots is not True:
                 state["slots_available"] = True
+                send_ntfy_alarm()
+                await send_alarm(
+                    app,
+                    f"🎉 <b>RDV SLOTS ARE AVAILABLE!</b>\n\n"
+                    f"👉 <a href=\"{RESCHEDULE_URL}\">Reschedule NOW</a>"
+                )
                 # Re-evaluate auto_book dynamically each time
                 current_auto_book = bool(_current_target_date() and _get_session_path())
                 if current_auto_book:
                     await try_book_earlier_slot(app)
-                else:
-                    send_ntfy_alarm()
-                    await send_alarm(
-                        app,
-                        f"🎉 <b>RDV SLOTS ARE AVAILABLE!</b>\n\n"
-                        f"👉 <a href=\"{RESCHEDULE_URL}\">Reschedule NOW</a>"
-                    )
 
         # ── No slots ──────────────────────────────────────────────────────────
         elif status == "unavailable":
