@@ -241,7 +241,7 @@ async def init_persistent_browser() -> bool:
             ws_endpoint = open(ENDPOINT_FILE).read().strip()
             logger.info(f"Persistent browser: connecting to existing browser ({ws_endpoint[:50]}…)")
             pw      = await async_playwright().start()
-            browser = await pw.chromium.connect(ws_endpoint)
+            browser = await pw.chromium.connect_over_cdp(ws_endpoint)
             ctx     = browser.contexts[0] if browser.contexts else await browser.new_context(locale="fr-FR")
             _browser_state["pw"]      = pw
             _browser_state["browser"] = browser

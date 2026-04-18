@@ -17,14 +17,13 @@ ENDPOINT_FILE    = "browser_endpoint.txt"
 
 async def main() -> None:
     async with async_playwright() as pw:
-        # launch_server() exposes a WS endpoint that bot.py can connect to
-        browser_server = await pw.chromium.launch_server(headless=False)
-        ws_endpoint    = browser_server.ws_endpoint
-
-        # Connect a client to that server to do the actual browsing
-        browser = await pw.chromium.connect(ws_endpoint)
-        ctx     = await browser.new_context(locale="fr-FR")
-        page    = await ctx.new_page()
+        # Launch with remote debugging so bot.py can connect to this browser
+        browser = await pw.chromium.launch(
+            headless=False,
+            args=["--remote-debugging-port=9222"],
+        )
+        ctx  = await browser.new_context(locale="fr-FR")
+        page = await ctx.new_page()
 
         print("\n=== Login helper ===")
         print("Browser opening... Log in via France Connect → impôts.gouv.fr.")
@@ -42,9 +41,10 @@ async def main() -> None:
 
         b64 = base64.b64encode(json.dumps(cookies_only).encode()).decode()
 
-        # Save the WS endpoint so bot.py can connect to THIS browser server
+        # Save the CDP endpoint so bot.py can connect to THIS browser
+        cdp_endpoint = "http://localhost:9222"
         with open(ENDPOINT_FILE, "w", encoding="utf-8") as f:
-            f.write(ws_endpoint)
+            f.write(cdp_endpoint)
 
         print(f"\n✅ Session saved to {SESSION_FILE}")
         print(f"   Cookies: {len(cookies_only['cookies'])}")
@@ -62,7 +62,7 @@ async def main() -> None:
         except (asyncio.CancelledError, KeyboardInterrupt):
             print("\nShutting down browser...")
 
-        await browser_server.close()
+        await browser.close()
 
 
 if __name__ == "__main__":
