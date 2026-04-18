@@ -192,15 +192,28 @@ def _is_bookable(d: date) -> bool:
 
 # ── Persistent browser ────────────────────────────────────────────────────────
 
+def _load_session_cookie_objects() -> list:
+    """Return the raw cookie objects (with domain, path, etc.) from the session file."""
+    path = _get_session_path()
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("cookies", [])
+    except Exception:
+        return []
+
+
 async def init_persistent_browser() -> bool:
     """
     Start a single Playwright browser and load the saved session into it.
     The same browser stays alive forever — impôts.gouv always sees the same device.
     Returns True if the browser was initialised successfully.
     """
-    session_path = _get_session_path()
-    if not session_path:
-        logger.warning("Persistent browser: no session found, browser not started")
+    cookie_objects = _load_session_cookie_objects()
+    if not cookie_objects:
+        logger.warning("Persistent browser: no session cookies found, browser not started")
         return False
 
     # Clean up any previous instance
@@ -209,15 +222,15 @@ async def init_persistent_browser() -> bool:
     try:
         pw      = await async_playwright().start()
         browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context(
-            storage_state=session_path,
-            locale="fr-FR",
-            user_agent=BROWSER_UA,
-        )
+        ctx     = await browser.new_context(locale="fr-FR", user_agent=BROWSER_UA)
+
+        # Add cookies using full objects (preserves domain, path, secure, etc.)
+        await ctx.add_cookies(cookie_objects)
+
         _browser_state["pw"]      = pw
         _browser_state["browser"] = browser
         _browser_state["context"] = ctx
-        logger.info("Persistent browser: initialised")
+        logger.info(f"Persistent browser: initialised with {len(cookie_objects)} cookies")
         return True
     except Exception as exc:
         logger.error(f"Persistent browser init failed: {exc}")
