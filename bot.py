@@ -205,6 +205,27 @@ def _load_session_cookie_objects() -> list:
         return []
 
 
+def _sanitize_cookies_for_playwright(cookies: list) -> list:
+    """
+    Playwright's add_cookies() only accepts specific fields.
+    Strip anything else to avoid validation errors.
+    """
+    valid_fields = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite", "url"}
+    valid_same_site = {"Strict", "Lax", "None"}
+    result = []
+    for c in cookies:
+        clean = {k: v for k, v in c.items() if k in valid_fields}
+        # Normalise sameSite capitalisation
+        if "sameSite" in clean:
+            ss = str(clean["sameSite"]).capitalize()
+            clean["sameSite"] = ss if ss in valid_same_site else "None"
+        # Playwright requires domain to start with a dot for host cookies
+        if "domain" in clean and not clean["domain"].startswith(".") and not clean.get("url"):
+            clean["domain"] = "." + clean["domain"]
+        result.append(clean)
+    return result
+
+
 async def init_persistent_browser() -> bool:
     """
     Start a single Playwright browser and load the saved session into it.
@@ -220,20 +241,27 @@ async def init_persistent_browser() -> bool:
     await _close_browser_quietly()
 
     try:
-        pw      = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context(locale="fr-FR", user_agent=BROWSER_UA)
+        logger.info("Persistent browser: starting Playwright…")
+        pw = await async_playwright().start()
 
-        # Add cookies using full objects (preserves domain, path, secure, etc.)
-        await ctx.add_cookies(cookie_objects)
+        logger.info("Persistent browser: launching Chromium…")
+        browser = await pw.chromium.launch(headless=True)
+
+        logger.info("Persistent browser: creating context…")
+        ctx = await browser.new_context(locale="fr-FR", user_agent=BROWSER_UA)
+
+        logger.info("Persistent browser: adding cookies…")
+        clean_cookies = _sanitize_cookies_for_playwright(cookie_objects)
+        await ctx.add_cookies(clean_cookies)
 
         _browser_state["pw"]      = pw
         _browser_state["browser"] = browser
         _browser_state["context"] = ctx
-        logger.info(f"Persistent browser: initialised with {len(cookie_objects)} cookies")
+        logger.info(f"Persistent browser: ready ({len(clean_cookies)} cookies loaded)")
         return True
     except Exception as exc:
-        logger.error(f"Persistent browser init failed: {exc}")
+        logger.error(f"Persistent browser init failed: {type(exc).__name__}: {exc}")
+        await _close_browser_quietly()
         return False
 
 
