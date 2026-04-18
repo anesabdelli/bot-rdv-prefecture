@@ -7,6 +7,7 @@ Detection logic:
   - "tous les créneaux sont pris" in page text  → no slots
   - phrase absent on HTTP 200                   → slots available → try to book
   - HTTP 429 / 403 / CAPTCHA                    → blocked → back off
+  - redirected to login page                    → session expired → notify user
 """
 
 import asyncio
@@ -34,12 +35,14 @@ load_dotenv(dotenv_path=".env", override=False)
 BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID", "")
 NTFY_TOPIC       = os.getenv("NTFY_TOPIC", "")
-SESSION_STATE    = os.getenv("SESSION_STATE", "")   # base64 from login.py
-CURRENT_RDV_DATE = os.getenv("CURRENT_RDV_DATE", "") # YYYY-MM-DD  e.g. 2026-05-19
+CURRENT_RDV_DATE = os.getenv("CURRENT_RDV_DATE", "")  # YYYY-MM-DD — your current appointment
 
 RESCHEDULE_URL = "https://rdv.anct.gouv.fr/users/rdvs/779995/creneaux"
 VIEW_URL       = "https://rdv.anct.gouv.fr/users/rdvs/779995"
 SESSION_FILE   = "session.json"
+
+# Hard limit — NEVER book anything on or after this date no matter what
+HARD_LIMIT_DATE = date(2026, 5, 19)
 
 CHECK_INTERVAL      = 0.8  # seconds between checks
 REQUEST_TIMEOUT     = 15   # seconds for HTTP request
@@ -70,15 +73,16 @@ USER_AGENTS = [
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 state: dict = {
-    "monitoring":       False,
-    "slots_available":  None,   # None = unknown, True = yes, False = no
-    "blocked":          False,
-    "check_count":      0,
-    "last_check":       None,
-    "extra_wait":       0,
-    "error_streak":     0,
-    "current_rdv_date": None,   # updated in memory after each booking
-    "booking_active":   False,  # prevent concurrent booking attempts
+    "monitoring":        False,
+    "slots_available":   None,   # None = unknown, True = yes, False = no
+    "blocked":           False,
+    "check_count":       0,
+    "last_check":        None,
+    "extra_wait":        0,
+    "error_streak":      0,
+    "current_rdv_date":  None,   # updated in memory after each successful booking
+    "booking_active":    False,  # prevents concurrent booking attempts
+    "session_notified":  False,  # prevents spamming session-expired messages
 }
 
 FRENCH_MONTHS = {
@@ -92,7 +96,6 @@ FRENCH_MONTHS = {
 
 def _get_session_path() -> Optional[str]:
     """Return path to a valid session.json (from env var or local file)."""
-    # Read dynamically so Railway variable changes are picked up without restart
     session_state = os.getenv("SESSION_STATE", "")
     if session_state:
         try:
@@ -103,14 +106,11 @@ def _get_session_path() -> Optional[str]:
             )
             tmp.write(decoded)
             tmp.close()
-            logger.info("Session loaded from SESSION_STATE env var")
             return tmp.name
         except Exception as exc:
             logger.error(f"Failed to decode SESSION_STATE: {exc}")
     if os.path.exists(SESSION_FILE):
-        logger.info("Session loaded from session.json file")
         return SESSION_FILE
-    logger.warning("No session found (SESSION_STATE env var not set and no session.json)")
     return None
 
 
@@ -148,7 +148,10 @@ def _parse_french_date(text: str) -> Optional[date]:
 
 
 def _current_target_date() -> Optional[date]:
-    """Return the current appointment date to beat (in-memory or from env)."""
+    """
+    Return the date the bot is currently trying to beat.
+    Uses in-memory value (updated after bookings) or falls back to env var.
+    """
     if state["current_rdv_date"]:
         return state["current_rdv_date"]
     if CURRENT_RDV_DATE:
@@ -159,14 +162,29 @@ def _current_target_date() -> Optional[date]:
     return None
 
 
+def _is_bookable(d: date) -> bool:
+    """
+    Return True only if d is strictly before both the current target
+    and the hard limit (19 mai 2026). Never book on or after 19 mai.
+    """
+    target = _current_target_date()
+    if target and d >= target:
+        return False
+    if d >= HARD_LIMIT_DATE:
+        return False
+    return True
+
+
 # ── Website checker ───────────────────────────────────────────────────────────
 
 def check_slots() -> dict:
     """
-    Fetch the reschedule page (with session cookies) and return:
-      { "status": "available"|"unavailable"|"blocked"|"rate_limited"|"captcha"|"error",
-        "detail": str, "http_code": int|None }
+    Fetch the reschedule page with session cookies.
+    Returns: { "status": str, "detail": str, "http_code": int|None }
+    Statuses: available | unavailable | session_expired | blocked |
+              rate_limited | captcha | error
     """
+    cookies = _load_session_cookies()
     headers = {
         "User-Agent":                random.choice(USER_AGENTS),
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -176,7 +194,6 @@ def check_slots() -> dict:
         "Upgrade-Insecure-Requests": "1",
         "Cache-Control":             "no-cache",
     }
-    cookies = _load_session_cookies()
 
     try:
         resp = requests.get(
@@ -204,18 +221,16 @@ def check_slots() -> dict:
 
     # Session expired → redirected to login page
     if "sign_in" in resp.url or "franceconnect" in resp.url:
-        return {"status": "error",
-                "detail": "Session expired — run login.py and update SESSION_STATE",
+        return {"status": "session_expired",
+                "detail": "Session expired — need to re-login",
                 "http_code": 200}
 
     soup      = BeautifulSoup(resp.text, "html.parser")
     page_text = soup.get_text(separator=" ", strip=True).lower()
 
-    # CAPTCHA
     if any(s in page_text for s in ["captcha", "i'm not a robot", "cloudflare"]):
         return {"status": "captcha", "detail": "CAPTCHA detected", "http_code": 200}
 
-    # No slots
     if any(p in page_text for p in [
         "tous les créneaux sont pris",
         "aucun créneau", "aucun créneaux", "aucune disponibilité",
@@ -269,30 +284,32 @@ def send_ntfy_alarm() -> None:
 
 async def try_book_earlier_slot(app: Application) -> bool:
     """
-    Open a Playwright browser with the saved session, navigate to the reschedule
-    page, find the earliest slot before the current appointment date, and book it.
-    Returns True if a booking was made.
+    Launch a headless browser with the saved session, open the reschedule page,
+    find the earliest slot that passes _is_bookable(), and confirm it.
+    Returns True if a booking was successfully made.
     """
     if state["booking_active"]:
-        return False  # already booking, skip
+        logger.info("Auto-booking: already in progress, skipping")
+        return False
 
     target = _current_target_date()
     if not target:
-        logger.warning("CURRENT_RDV_DATE not set — skipping auto-booking")
+        logger.warning("Auto-booking skipped: CURRENT_RDV_DATE not set")
         return False
 
     session_path = _get_session_path()
     if not session_path:
         await send_notification(
             app,
-            "⚠️ <b>Auto-booking disabled:</b> no session found.\n"
+            "⚠️ <b>Auto-booking:</b> no session found.\n"
             "Run <code>python login.py</code> on your PC."
         )
         return False
 
     state["booking_active"] = True
-    logger.info(f"Auto-booking: launching browser (target: before {target})…")
+    logger.info(f"Auto-booking: launching browser (beat {target}, hard limit {HARD_LIMIT_DATE})…")
 
+    page = None
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
@@ -306,15 +323,10 @@ async def try_book_earlier_slot(app: Application) -> bool:
             await page.goto(RESCHEDULE_URL, timeout=30_000)
             await page.wait_for_load_state("networkidle", timeout=20_000)
 
-            # Session expired
+            # Session expired inside Playwright
             if any(x in page.url for x in ("sign_in", "franceconnect", "impots.gouv")):
-                logger.warning("Auto-booking: session expired")
-                await send_notification(
-                    app,
-                    "🔒 <b>Session expired.</b>\n"
-                    "Run <code>python login.py</code> on your PC, then update "
-                    "<code>SESSION_STATE</code> on Railway."
-                )
+                logger.warning("Auto-booking: session expired (Playwright)")
+                state["session_notified"] = False  # force fresh notification
                 return False
 
             page_text = (await page.inner_text("body")).lower()
@@ -322,20 +334,19 @@ async def try_book_earlier_slot(app: Application) -> bool:
                 logger.info("Auto-booking: no slots on page")
                 return False
 
-            # Find all slot links/buttons on the page
+            # Find all slot elements
             slots = await page.query_selector_all(
                 "a[href*='creneau'], a[href*='créneau'], "
                 "button[data-date], button[data-time], "
                 "[class*='creneau']:not([disabled]), "
                 "[class*='slot']:not([disabled])"
             )
-
             if not slots:
-                logger.info("Auto-booking: no slot elements found")
+                logger.info("Auto-booking: no slot elements found in DOM")
                 return False
 
-            # Find slots earlier than our target date
-            earlier: list[tuple[date, object, str]] = []
+            # Keep only slots that pass the hard limit + current target check
+            bookable: list[tuple[date, object, str]] = []
             for slot in slots:
                 raw = (
                     await slot.get_attribute("aria-label")
@@ -343,21 +354,21 @@ async def try_book_earlier_slot(app: Application) -> bool:
                     or await slot.inner_text()
                 ) or ""
                 parsed = _parse_french_date(raw)
-                if parsed and parsed < target:
-                    earlier.append((parsed, slot, raw.strip()))
+                if parsed and _is_bookable(parsed):
+                    bookable.append((parsed, slot, raw.strip()))
 
-            if not earlier:
-                logger.info("Auto-booking: slots exist but none earlier than current date")
+            if not bookable:
+                logger.info("Auto-booking: no bookable slots earlier than target/hard-limit")
                 return False
 
-            # Pick the earliest date
-            earlier.sort(key=lambda x: x[0])
-            best_date, best_el, best_label = earlier[0]
-            logger.info(f"Auto-booking: clicking '{best_label}'…")
+            # Pick the earliest
+            bookable.sort(key=lambda x: x[0])
+            best_date, best_el, best_label = bookable[0]
+            logger.info(f"Auto-booking: clicking '{best_label}' ({best_date})…")
             await best_el.click()
             await page.wait_for_load_state("networkidle", timeout=15_000)
 
-            # Confirm button
+            # Confirm
             confirm = await page.query_selector(
                 "button:has-text('Confirmer'), button:has-text('Valider'), "
                 "button:has-text('OK'), input[type='submit']"
@@ -366,37 +377,55 @@ async def try_book_earlier_slot(app: Application) -> bool:
                 await confirm.click()
                 await page.wait_for_load_state("networkidle", timeout=15_000)
 
+            # Verify booking went through — page should no longer be on the slot picker
+            current_url = page.url
+            if "creneaux" in current_url:
+                logger.warning("Auto-booking: still on creneaux page after confirm — may have failed")
+                await send_notification(
+                    app,
+                    f"⚠️ <b>Booking uncertain.</b>\n"
+                    f"Tried to book {best_date.strftime('%d/%m/%Y')} but couldn't confirm success.\n"
+                    f"👉 <a href=\"{VIEW_URL}\">Check your appointment manually</a>"
+                )
+                return False
+
             await browser.close()
 
             booked_str = best_date.strftime("%d/%m/%Y")
-            logger.info(f"Auto-booking: booked {booked_str}")
+            logger.info(f"Auto-booking: confirmed {booked_str}")
 
-            # Update in-memory target — keep hunting for something even earlier
+            # Update in-memory target so next booking must be even earlier
             state["current_rdv_date"] = best_date
 
             send_ntfy_alarm()
             await send_alarm(
                 app,
                 f"🎉 <b>Appointment rescheduled!</b>\n"
-                f"New date: <b>{booked_str}</b>\n\n"
-                f"Still monitoring for anything earlier…\n"
+                f"New date : <b>{booked_str}</b>\n"
+                f"Still monitoring for anything earlier than {booked_str}…\n\n"
+                f"⚠️ Update <code>CURRENT_RDV_DATE={best_date.strftime('%Y-%m-%d')}</code> "
+                f"on Railway so the bot remembers after a restart.\n"
                 f"👉 <a href=\"{VIEW_URL}\">View your appointment</a>"
             )
             return True
 
     except PWTimeout:
-        logger.error("Auto-booking: timed out")
-        try:
-            await page.screenshot(path="booking_error.png")
-        except Exception:
-            pass
+        logger.error("Auto-booking: timed out waiting for page")
+        await send_notification(app, "⚠️ <b>Auto-booking timed out.</b> Will retry on next slot detection.")
+        if page:
+            try:
+                await page.screenshot(path="booking_error.png")
+            except Exception:
+                pass
         return False
     except Exception as exc:
         logger.error(f"Auto-booking error: {exc}")
-        try:
-            await page.screenshot(path="booking_error.png")
-        except Exception:
-            pass
+        await send_notification(app, f"⚠️ <b>Auto-booking error:</b> {exc}")
+        if page:
+            try:
+                await page.screenshot(path="booking_error.png")
+            except Exception:
+                pass
         return False
     finally:
         state["booking_active"] = False
@@ -406,12 +435,18 @@ async def try_book_earlier_slot(app: Application) -> bool:
 
 async def monitor_loop(app: Application) -> None:
     logger.info("Monitoring loop started")
-    auto_book = bool(CURRENT_RDV_DATE and _get_session_path())
+
+    target    = _current_target_date()
+    has_session = bool(_get_session_path())
+    auto_book = bool(target and has_session)
+
     await send_notification(
         app,
         f"🔍 <b>Monitoring started</b>\n"
-        f"Checking every {CHECK_INTERVAL}s\n"
-        f"Auto-booking: {'✅ enabled' if auto_book else '❌ disabled (SESSION_STATE / CURRENT_RDV_DATE not set)'}"
+        f"Interval     : every {CHECK_INTERVAL}s\n"
+        f"Target date  : before {target.strftime('%d/%m/%Y') if target else 'not set'}\n"
+        f"Hard limit   : {HARD_LIMIT_DATE.strftime('%d/%m/%Y')} (never book on/after)\n"
+        f"Auto-booking : {'✅ enabled' if auto_book else '❌ disabled'}"
     )
 
     while state["monitoring"]:
@@ -436,6 +471,28 @@ async def monitor_loop(app: Application) -> None:
         state["last_check"]   = datetime.now()
         logger.info(f"Check #{state['check_count']}: [{status}] {detail}")
 
+        # ── Session expired ───────────────────────────────────────────────────
+        if status == "session_expired":
+            if not state["session_notified"]:
+                state["session_notified"] = True
+                await send_notification(
+                    app,
+                    "🔒 <b>Session expired!</b>\n\n"
+                    "1. Run <code>python login.py</code> on your PC\n"
+                    "2. Copy the <code>SESSION_STATE=...</code> value\n"
+                    "3. Update it in Railway Variables\n\n"
+                    "Monitoring continues but auto-booking is paused until you do this."
+                )
+            state["slots_available"] = None
+            await asyncio.sleep(CHECK_INTERVAL)
+            continue
+
+        # Session back — reset notification flag
+        if state["session_notified"] and status != "session_expired":
+            state["session_notified"] = False
+            await send_notification(app, "✅ <b>Session restored.</b> Auto-booking is active again.")
+
+        # ── Blocked / rate-limited / CAPTCHA ──────────────────────────────────
         if status in ("blocked", "rate_limited", "captcha"):
             state["error_streak"] += 1
             if not state["blocked"]:
@@ -454,20 +511,24 @@ async def monitor_loop(app: Application) -> None:
             state["error_streak"] = 0
             await send_notification(app, "✅ <b>Monitoring resumed.</b>")
 
+        # ── Generic error ─────────────────────────────────────────────────────
         if status == "error":
             state["error_streak"] += 1
             if state["error_streak"] == 1:
-                await send_notification(app, f"⚠️ <b>Check failed</b>\n{detail}")
+                await send_notification(app, f"⚠️ <b>Check failed:</b> {detail}")
             state["slots_available"] = None
             await asyncio.sleep(CHECK_INTERVAL)
             continue
 
         state["error_streak"] = 0
 
+        # ── Slots available ───────────────────────────────────────────────────
         if status == "available":
             if prev_slots is not True:
                 state["slots_available"] = True
-                if auto_book:
+                # Re-evaluate auto_book dynamically each time
+                current_auto_book = bool(_current_target_date() and _get_session_path())
+                if current_auto_book:
                     await try_book_earlier_slot(app)
                 else:
                     send_ntfy_alarm()
@@ -477,9 +538,10 @@ async def monitor_loop(app: Application) -> None:
                         f"👉 <a href=\"{RESCHEDULE_URL}\">Reschedule NOW</a>"
                     )
 
+        # ── No slots ──────────────────────────────────────────────────────────
         elif status == "unavailable":
             if prev_slots is True:
-                await send_notification(app, "ℹ️ <b>Slots are gone again.</b> Continuing…")
+                await send_notification(app, "ℹ️ <b>Slots are gone.</b> Continuing to monitor…")
             state["slots_available"] = False
 
         await asyncio.sleep(CHECK_INTERVAL)
@@ -508,11 +570,12 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if state["monitoring"]:
         await update.message.reply_text("Already monitoring! Use /status to check.")
         return
-    state["monitoring"]      = True
-    state["blocked"]         = False
-    state["extra_wait"]      = 0
-    state["error_streak"]    = 0
-    state["slots_available"] = None
+    state["monitoring"]       = True
+    state["blocked"]          = False
+    state["extra_wait"]       = 0
+    state["error_streak"]     = 0
+    state["slots_available"]  = None
+    state["session_notified"] = False
     ctx.application.create_task(monitor_loop(ctx.application))
 
 
@@ -528,8 +591,15 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔄 Checking…")
     result = check_slots()
     status = result["status"]
-    emoji  = {"available": "✅", "unavailable": "❌", "blocked": "⛔",
-               "rate_limited": "🚫", "captcha": "🤖", "error": "⚠️"}.get(status, "❓")
+    emoji  = {
+        "available":      "✅",
+        "unavailable":    "❌",
+        "session_expired":"🔒",
+        "blocked":        "⛔",
+        "rate_limited":   "🚫",
+        "captcha":        "🤖",
+        "error":          "⚠️",
+    }.get(status, "❓")
     msg = f"{emoji} <b>{status.upper()}</b>\n{result['detail']}\nHTTP: {result['http_code'] or 'N/A'}"
     if status == "available":
         msg += f'\n\n👉 <a href="{RESCHEDULE_URL}">Reschedule NOW</a>'
@@ -548,7 +618,6 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check session by doing a lightweight HTTP request with the saved cookies."""
     has_env_var = bool(os.getenv("SESSION_STATE", ""))
     has_file    = os.path.exists(SESSION_FILE)
     cookies     = _load_session_cookies()
@@ -558,8 +627,8 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ <b>No session found.</b>\n\n"
             f"SESSION_STATE env var : {'✅ set' if has_env_var else '❌ not set'}\n"
             f"session.json file     : {'✅ exists' if has_file else '❌ not found'}\n\n"
-            f"Run <code>python login.py</code> on your PC, copy the "
-            f"<code>SESSION_STATE=...</code> value and add it to Railway variables."
+            f"Run <code>python login.py</code> on your PC and add "
+            f"<code>SESSION_STATE</code> to Railway variables."
         )
         return
 
@@ -572,44 +641,50 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             timeout=15,
             allow_redirects=True,
         )
-        final_url = resp.url
-        if any(x in final_url for x in ("sign_in", "franceconnect", "impots.gouv")):
+        if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
             await update.message.reply_html(
                 "🔒 <b>Session expired.</b>\n"
                 "Re-run <code>python login.py</code> and update <code>SESSION_STATE</code> on Railway."
             )
         else:
-            page_text = resp.text.lower()
-            if "tous les créneaux sont pris" in page_text:
-                slot_status = "❌ No slots currently available"
-            else:
-                slot_status = "✅ Slots appear available right now!"
+            page_text   = resp.text.lower()
+            slot_status = (
+                "❌ No slots right now"
+                if "tous les créneaux sont pris" in page_text
+                else "✅ Slots appear available!"
+            )
+            target = _current_target_date()
             await update.message.reply_html(
                 f"✅ <b>Session is valid.</b>\n\n"
-                f"Cookies loaded : {len(cookies)}\n"
-                f"Slots status   : {slot_status}\n"
-                f"Target date    : before {(_current_target_date() or 'not set')}"
+                f"Cookies     : {len(cookies)}\n"
+                f"Slots now   : {slot_status}\n"
+                f"Target      : before {target.strftime('%d/%m/%Y') if target else 'not set'}\n"
+                f"Hard limit  : never book on/after {HARD_LIMIT_DATE.strftime('%d/%m/%Y')}"
             )
     except Exception as exc:
-        await update.message.reply_html(f"⚠️ <b>Error checking session:</b> {exc}")
+        await update.message.reply_html(f"⚠️ <b>Error:</b> {exc}")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    s          = state
-    slot_icon  = {True: "✅ Available", False: "❌ Unavailable", None: "❓ Unknown"}[s["slots_available"]]
-    last       = s["last_check"].strftime("%d/%m %H:%M:%S") if s["last_check"] else "never"
-    target     = _current_target_date()
-    target_str = target.strftime("%d/%m/%Y") if target else "not set"
+    s           = state
+    slot_icon   = {True: "✅ Available", False: "❌ Unavailable", None: "❓ Unknown"}[s["slots_available"]]
+    last        = s["last_check"].strftime("%d/%m %H:%M:%S") if s["last_check"] else "never"
+    target      = _current_target_date()
+    target_str  = target.strftime("%d/%m/%Y") if target else "not set"
+    auto_book   = bool(target and _get_session_path())
     await update.message.reply_html(
         f"📊 <b>Bot Status</b>\n\n"
         f"Monitoring   : {'🟢 ON' if s['monitoring'] else '🔴 OFF'}\n"
-        f"Slots        : {slot_icon}\n"
+        f"Slots now    : {slot_icon}\n"
         f"Blocked      : {'⛔ YES' if s['blocked'] else '✅ no'}\n"
+        f"Session      : {'🔒 EXPIRED' if s['session_notified'] else '✅ ok'}\n"
+        f"Booking lock : {'🔄 active' if s['booking_active'] else '✅ free'}\n"
         f"Checks done  : {s['check_count']}\n"
         f"Last check   : {last}\n"
         f"Interval     : {CHECK_INTERVAL}s\n"
-        f"Target date  : before {target_str}\n"
-        f"Auto-booking : {'✅ ON' if CURRENT_RDV_DATE and _get_session_path() else '❌ OFF'}"
+        f"Target       : before {target_str}\n"
+        f"Hard limit   : {HARD_LIMIT_DATE.strftime('%d/%m/%Y')}\n"
+        f"Auto-booking : {'✅ ON' if auto_book else '❌ OFF'}"
     )
 
 
