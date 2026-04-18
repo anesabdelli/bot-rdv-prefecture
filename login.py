@@ -17,7 +17,12 @@ ENDPOINT_FILE    = "browser_endpoint.txt"
 
 async def main() -> None:
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
+        # launch_server() exposes a WS endpoint that bot.py can connect to
+        browser_server = await pw.chromium.launch_server(headless=False)
+        ws_endpoint    = browser_server.ws_endpoint
+
+        # Connect a client to that server to do the actual browsing
+        browser = await pw.chromium.connect(ws_endpoint)
         ctx     = await browser.new_context(locale="fr-FR")
         page    = await ctx.new_page()
 
@@ -37,8 +42,7 @@ async def main() -> None:
 
         b64 = base64.b64encode(json.dumps(cookies_only).encode()).decode()
 
-        # Save the browser WebSocket endpoint so bot.py can connect to THIS browser
-        ws_endpoint = browser.ws_endpoint
+        # Save the WS endpoint so bot.py can connect to THIS browser server
         with open(ENDPOINT_FILE, "w", encoding="utf-8") as f:
             f.write(ws_endpoint)
 
@@ -52,13 +56,13 @@ async def main() -> None:
         print("   Keep THIS terminal running — closing it kills the browser and session.\n")
         print("   Press Ctrl+C to stop.\n")
 
-        # Keep the browser alive forever
+        # Keep the browser server alive forever
         try:
             await asyncio.Event().wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             print("\nShutting down browser...")
 
-        await browser.close()
+        await browser_server.close()
 
 
 if __name__ == "__main__":
