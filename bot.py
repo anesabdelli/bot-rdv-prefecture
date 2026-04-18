@@ -92,20 +92,25 @@ FRENCH_MONTHS = {
 
 def _get_session_path() -> Optional[str]:
     """Return path to a valid session.json (from env var or local file)."""
-    if SESSION_STATE:
+    # Read dynamically so Railway variable changes are picked up without restart
+    session_state = os.getenv("SESSION_STATE", "")
+    if session_state:
         try:
-            decoded = base64.b64decode(SESSION_STATE.encode()).decode()
-            json.loads(decoded)  # validate
+            decoded = base64.b64decode(session_state.encode()).decode()
+            json.loads(decoded)  # validate JSON
             tmp = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".json", delete=False, encoding="utf-8"
             )
             tmp.write(decoded)
             tmp.close()
+            logger.info("Session loaded from SESSION_STATE env var")
             return tmp.name
         except Exception as exc:
             logger.error(f"Failed to decode SESSION_STATE: {exc}")
     if os.path.exists(SESSION_FILE):
+        logger.info("Session loaded from session.json file")
         return SESSION_FILE
+    logger.warning("No session found (SESSION_STATE env var not set and no session.json)")
     return None
 
 
@@ -543,11 +548,17 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    has_env_var  = bool(os.getenv("SESSION_STATE", ""))
+    has_file     = os.path.exists(SESSION_FILE)
     session_path = _get_session_path()
+
     if not session_path:
         await update.message.reply_html(
-            "❌ <b>No session found.</b>\n"
-            "Run <code>python login.py</code> on your PC."
+            f"❌ <b>No session found.</b>\n\n"
+            f"SESSION_STATE env var: {'✅ set' if has_env_var else '❌ not set'}\n"
+            f"session.json file: {'✅ exists' if has_file else '❌ not found'}\n\n"
+            f"Run <code>python login.py</code> on your PC, then add "
+            f"<code>SESSION_STATE</code> to Railway variables."
         )
         return
     await update.message.reply_text("🔄 Checking session…")
