@@ -1,5 +1,7 @@
 .env
 .claude/
 bot.log
+session.json
+booking_error.png
 __pycache__/
 *.pyc
