@@ -197,8 +197,13 @@ def check_slots() -> dict:
 
     try:
         resp = requests.get(
-            RESCHEDULE_URL, headers=headers, cookies=cookies, timeout=REQUEST_TIMEOUT
+            RESCHEDULE_URL, headers=headers, cookies=cookies,
+            timeout=REQUEST_TIMEOUT, max_redirects=10,
         )
+    except requests.exceptions.TooManyRedirects:
+        return {"status": "session_expired",
+                "detail": "Too many redirects — session expired (redirect loop)",
+                "http_code": None}
     except requests.exceptions.Timeout:
         return {"status": "error", "detail": "Request timed out", "http_code": None}
     except requests.exceptions.ConnectionError as exc:
