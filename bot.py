@@ -413,46 +413,32 @@ def send_ntfy_alarm() -> None:
 
 # ── Session keep-alive (uses persistent browser) ──────────────────────────────
 
-async def session_keepalive(job_ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def session_keepalive(_job_ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Every 5 minutes: hit the authenticated RDV page via HTTP to reset the
-    sliding session timer. HTTP is reliable and has no redirect false-positives.
+    Every 5 minutes: open a page in the persistent browser and visit the
+    authenticated RDV page to reset the sliding session timer.
+    The browser has live auto-updating cookies — no stale file reads.
+    No expiry notifications here — booking attempts handle that.
     """
-    def _ping() -> str:
-        cookies = _load_session_cookies()
-        if not cookies:
-            return "no_session"
-        try:
-            s = requests.Session()
-            s.max_redirects = 10
-            resp = s.get(
-                RESCHEDULE_URL,
-                headers={"User-Agent": BROWSER_UA, "Accept-Language": "fr-FR"},
-                cookies=cookies,
-                timeout=REQUEST_TIMEOUT,
-            )
-            if any(x in resp.url for x in ("sign_in", "franceconnect", "impots.gouv")):
-                return "expired"
-            return "ok"
-        except requests.exceptions.TooManyRedirects:
-            return "expired"
-        except Exception as exc:
-            return f"error:{exc}"
+    ctx = _browser_state.get("context")
+    if ctx is None:
+        logger.info("Session keep-alive: no browser context, skipping")
+        return
 
-    result = await asyncio.get_event_loop().run_in_executor(None, _ping)
-    if result == "ok":
-        logger.info("Session keep-alive: OK")
-    elif result == "no_session":
-        logger.info("Session keep-alive: skipped (no cookies)")
-    elif result == "expired":
-        logger.warning("Session keep-alive: session expired")
-        await send_notification(
-            job_ctx.application,
-            "🔒 <b>Session expired!</b>\n\n"
-            "Restart <code>login.py</code>, log in again, then restart <code>bot.py</code>."
-        )
-    else:
-        logger.warning(f"Session keep-alive: {result}")
+    page = None
+    try:
+        page = await ctx.new_page()
+        await page.goto(RESCHEDULE_URL, timeout=20_000)
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+        logger.info(f"Session keep-alive: OK (landed on {page.url[:60]})")
+    except Exception as exc:
+        logger.warning(f"Session keep-alive error: {exc}")
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 # ── Auto-booking (uses persistent browser) ────────────────────────────────────
