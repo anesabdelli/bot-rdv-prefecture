@@ -44,6 +44,7 @@ CHECK_URL      = "https://rdv.anct.gouv.fr/prendre_rdv?departement=&motif_name_w
 RESCHEDULE_URL = "https://rdv.anct.gouv.fr/users/rdvs/779995/creneaux"
 VIEW_URL       = "https://rdv.anct.gouv.fr/users/rdvs/779995"
 SESSION_FILE   = "session.json"
+ENDPOINT_FILE  = "browser_endpoint.txt"
 
 # Hard limit — NEVER book anything on or after this date no matter what
 HARD_LIMIT_DATE = date(2026, 5, 19)
@@ -228,36 +229,46 @@ def _sanitize_cookies_for_playwright(cookies: list) -> list:
 
 async def init_persistent_browser() -> bool:
     """
-    Start a single Playwright browser and load the saved session into it.
-    The same browser stays alive forever — impôts.gouv always sees the same device.
-    Returns True if the browser was initialised successfully.
+    Connect to the browser kept alive by login.py (same device, same session).
+    Falls back to launching a new browser with saved cookies if no endpoint file exists.
+    Returns True if a browser context is ready.
     """
+    await _close_browser_quietly()
+
+    # ── Option 1: connect to the browser opened by login.py ──────────────────
+    if os.path.exists(ENDPOINT_FILE):
+        try:
+            ws_endpoint = open(ENDPOINT_FILE).read().strip()
+            logger.info(f"Persistent browser: connecting to existing browser ({ws_endpoint[:50]}…)")
+            pw      = await async_playwright().start()
+            browser = await pw.chromium.connect(ws_endpoint)
+            ctx     = browser.contexts[0] if browser.contexts else await browser.new_context(locale="fr-FR")
+            _browser_state["pw"]      = pw
+            _browser_state["browser"] = browser
+            _browser_state["context"] = ctx
+            logger.info("Persistent browser: connected to login.py browser ✅")
+            return True
+        except Exception as exc:
+            logger.warning(f"Persistent browser: could not connect to existing browser ({exc}), falling back…")
+            await _close_browser_quietly()
+
+    # ── Option 2: new browser + inject saved cookies ──────────────────────────
     cookie_objects = _load_session_cookie_objects()
     if not cookie_objects:
         logger.warning("Persistent browser: no session cookies found, browser not started")
         return False
 
-    # Clean up any previous instance
-    await _close_browser_quietly()
-
     try:
-        logger.info("Persistent browser: starting Playwright…")
-        pw = await async_playwright().start()
-
-        logger.info("Persistent browser: launching Chromium…")
+        logger.info("Persistent browser: launching new Chromium with saved cookies…")
+        pw      = await async_playwright().start()
         browser = await pw.chromium.launch(headless=True)
-
-        logger.info("Persistent browser: creating context…")
-        ctx = await browser.new_context(locale="fr-FR", user_agent=BROWSER_UA)
-
-        logger.info("Persistent browser: adding cookies…")
+        ctx     = await browser.new_context(locale="fr-FR", user_agent=BROWSER_UA)
         clean_cookies = _sanitize_cookies_for_playwright(cookie_objects)
         await ctx.add_cookies(clean_cookies)
-
         _browser_state["pw"]      = pw
         _browser_state["browser"] = browser
         _browser_state["context"] = ctx
-        logger.info(f"Persistent browser: ready ({len(clean_cookies)} cookies loaded)")
+        logger.info(f"Persistent browser: ready with {len(clean_cookies)} cookies (fallback mode)")
         return True
     except Exception as exc:
         logger.error(f"Persistent browser init failed: {type(exc).__name__}: {exc}")

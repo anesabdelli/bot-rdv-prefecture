@@ -2,6 +2,7 @@
 .claude/
 bot.log
 session.json
+browser_endpoint.txt
 booking_error.png
 __pycache__/
 *.pyc
