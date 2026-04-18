@@ -548,38 +548,50 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    has_env_var  = bool(os.getenv("SESSION_STATE", ""))
-    has_file     = os.path.exists(SESSION_FILE)
-    session_path = _get_session_path()
+    """Check session by doing a lightweight HTTP request with the saved cookies."""
+    has_env_var = bool(os.getenv("SESSION_STATE", ""))
+    has_file    = os.path.exists(SESSION_FILE)
+    cookies     = _load_session_cookies()
 
-    if not session_path:
+    if not cookies:
         await update.message.reply_html(
             f"❌ <b>No session found.</b>\n\n"
-            f"SESSION_STATE env var: {'✅ set' if has_env_var else '❌ not set'}\n"
-            f"session.json file: {'✅ exists' if has_file else '❌ not found'}\n\n"
-            f"Run <code>python login.py</code> on your PC, then add "
-            f"<code>SESSION_STATE</code> to Railway variables."
+            f"SESSION_STATE env var : {'✅ set' if has_env_var else '❌ not set'}\n"
+            f"session.json file     : {'✅ exists' if has_file else '❌ not found'}\n\n"
+            f"Run <code>python login.py</code> on your PC, copy the "
+            f"<code>SESSION_STATE=...</code> value and add it to Railway variables."
         )
         return
+
     await update.message.reply_text("🔄 Checking session…")
     try:
-        async with async_playwright() as pw:
-            browser    = await pw.chromium.launch(headless=True)
-            browser_ctx = await browser.new_context(storage_state=session_path, locale="fr-FR")
-            page       = await browser_ctx.new_page()
-            await page.goto(RESCHEDULE_URL, timeout=20_000)
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-            final_url  = page.url
-            await browser.close()
+        resp = requests.get(
+            RESCHEDULE_URL,
+            headers={"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "fr-FR"},
+            cookies=cookies,
+            timeout=15,
+            allow_redirects=True,
+        )
+        final_url = resp.url
         if any(x in final_url for x in ("sign_in", "franceconnect", "impots.gouv")):
             await update.message.reply_html(
                 "🔒 <b>Session expired.</b>\n"
-                "Run <code>python login.py</code> then update <code>SESSION_STATE</code> on Railway."
+                "Re-run <code>python login.py</code> and update <code>SESSION_STATE</code> on Railway."
             )
         else:
-            await update.message.reply_html("✅ <b>Session is valid.</b> Auto-booking is ready.")
+            page_text = resp.text.lower()
+            if "tous les créneaux sont pris" in page_text:
+                slot_status = "❌ No slots currently available"
+            else:
+                slot_status = "✅ Slots appear available right now!"
+            await update.message.reply_html(
+                f"✅ <b>Session is valid.</b>\n\n"
+                f"Cookies loaded : {len(cookies)}\n"
+                f"Slots status   : {slot_status}\n"
+                f"Target date    : before {(_current_target_date() or 'not set')}"
+            )
     except Exception as exc:
-        await update.message.reply_html(f"⚠️ <b>Error:</b> {exc}")
+        await update.message.reply_html(f"⚠️ <b>Error checking session:</b> {exc}")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
